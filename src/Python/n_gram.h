@@ -11,7 +11,7 @@ class NGram
 		const int size();
 		void addLine(PyObject *index, PyObject *str);
 		PyObject * search(PyObject *pattern);
-		PyObject * search(PyObject *pattern, const bool isStrict);
+		PyObject * search(PyObject *pattern, const unsigned int max_edit_dist);
 		void delLine(PyObject *index);
 
 		const int get_c_string(PyObject * str, char* &ref) const;

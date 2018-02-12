@@ -7,263 +7,280 @@
 #include <functional>
 #include <vector>
 #include <cstddef>
+#include <iostream>
+#include <string>
+#include <sstream>
+
+#define SPACER '*'
+#define PADDING '$'
+
+#define MIN3(a, b, c) ((a) < (b) ? ((a) < (c) ? (a) : (c)) : ((b) < (c) ? (b) : (c)))
+
+using namespace std;
 
 namespace Impl {
-	typedef unsigned long IndexKey;
-	typedef unsigned long HashKey;
-	typedef std::pair<char*, unsigned int> CStrLen;
 
-	inline const HashKey hash_of_string(const char *c_str, const unsigned int len)
+    template<class Doc, class Consumer>
+    struct n_gram
 	{
-		unsigned long hash = 5381;
-		for (unsigned int i = 0; i < len; i++)
-			hash = ((hash << 5) + hash) + c_str[i];
-		return hash;
-	}
-
-        template<class V, class Consumer>
-        struct n_gram
-	{
-		typedef std::pair<IndexKey, V *> IndexValue;
-		typedef std::list<IndexValue> IndexValueList;
-		typedef std::set<IndexValue> IndexValueSet;
-
-		typedef std::unordered_map<HashKey, IndexValueSet> NIndex;
-		typedef std::vector<NIndex> Indexes;
-
+		typedef std::pair<const char*, unsigned int> CStrLen;
 		typedef std::vector<CStrLen> CStrLenList;
-		typedef std::unordered_map<IndexKey, V *> Storage;
 
-		const unsigned int n_count_;
-		Indexes indexes_;
-		Storage storage_;
-		Consumer &consumer_;
+		// Keys
+		typedef unsigned long DocKey;
+		typedef unsigned long DocHash;
+		typedef unsigned long NgramHash;
 
-                n_gram(unsigned int n, Consumer &consumer) : n_count_(n), indexes_(n), consumer_(consumer){}
-                ~n_gram()
+		// N-gram inverted index
+		typedef std::pair<DocKey, CStrLen> IndexedDoc;
+		typedef std::list<IndexedDoc> IndexedDocList;
+		typedef std::set<IndexedDoc> IndexedDocSet;
+		typedef std::unordered_map<NgramHash, IndexedDocSet> NgramInvertedIndex;
+
+		// Document index
+		typedef std::unordered_map<DocKey, CStrLen> DocIndex;
+
+		// Document inverted index
+		typedef std::unordered_map<DocHash, DocKey> DocInvIndex;
+
+		// Document counters
+		typedef std::unordered_map<DocKey, unsigned long> Counter;
+		typedef std::pair<DocKey, unsigned long> Count;
+		typedef std::vector<Count> CountVector;
+
+		// ============================= UTILS =============================
+
+		inline const NgramHash hash(const char *c_str, const unsigned int len)
 		{
-			for (auto p: storage_) {
-				V *str = p.second;
-				consumer_.decr_refs(str);
+			unsigned long h = 5381;
+			for (unsigned int i = 0; i < len; i++)
+				h = ((h << 5) + h) + c_str[i];
+			return h;
+		}
+
+        struct CountByValueAsc {
+          bool operator() (const Count& a, const Count& b) const {
+            return a.second < b.second;
+          };
+        };
+
+		struct CountByValueDesc {
+          bool operator() (const Count& a, const Count& b) const {
+            return a.second > b.second;
+          };
+        };
+
+		// ============================= ===== =============================
+
+		Consumer &consumer_;
+		const unsigned int n;
+		NgramInvertedIndex inverted_index;
+		DocIndex doc_index;
+        string padding;
+
+        n_gram(unsigned int n, Consumer &consumer) : n(n), consumer_(consumer) {
+            padding = string(n - 1, PADDING);
+        }
+
+        ~n_gram()
+		{
+			for (IndexedDoc indexed_doc: doc_index) {
+				Doc *doc = indexed_doc.second;
+				consumer_.decr_refs(doc);
 			}
 		}
 
 		const int size()
 		{
-			return storage_.size();
+			return doc_index.size();
 		}
 
-		void add_line(IndexKey index, V *str)
+		void add_line(DocKey key, Doc *doc)
 		{
-			auto f = storage_.find(index);
-			if (f != storage_.end())
+			auto found = doc_index.find(key);
+			if (found != doc_index.end())
 				return;
 
-			consumer_.incr_refs(str);
+			consumer_.incr_refs(doc);
 
-			storage_.insert({index, str});
-			add_del_index(index, str, true);
+			doc_index.insert({key, doc});
+			add_del_index(key, doc);
 		}
 
-		void del_line(IndexKey index)
+		void add_del_index(DocKey key, Doc *python_doc)
 		{
-			auto f = storage_.find(index);
-			if (f == storage_.end())
-				return;
+			char *doc_cstr;
+			const unsigned int doc_size = consumer_.get_c_string(python_doc, doc_cstr);
+			CStrLen doc = {doc_cstr, doc_size};
 
-			V *str = f->second;
+            // Padding and spacing
+            string doc_str(doc_cstr);
+            string processed_str;
+            pad_and_space(doc_str, processed_str);
+            const char *processed_cstr = processed_str.c_str();
+            const unsigned int processed_size = processed_str.size();
+            CStrLen processed = {processed_cstr, processed_size};
 
-			add_del_index(index, str, false);
-			storage_.erase(f);
-			
-			consumer_.decr_refs(str);
-		}
+			CStrLenList ngrams;
+			create_ngrams(ngrams, cstr, size);
 
-		IndexValueList search(V *pattern, const bool is_strict)
-		{
-			char *c_str;
-			const int size = consumer_.get_c_string(pattern, c_str);
+			IndexedDoc indexed_doc = std::make_pair(key, processed);
 
-			CStrLenList substrs;
-			CStrLenList n_gramms;
-			select_substrs(n_gramms, substrs, c_str, size, is_strict);
-
-			IndexValueList result;
-			if (n_gramms.empty()) {
-				copy(storage_.begin(), storage_.end(), back_inserter(result));
-				return result;
-			}
-
-			IndexValueSet intersection;
-			bool is_init_intersection = true;
-
-			for (auto &p : n_gramms) {
-				const char *c = p.first;
-				const unsigned int len = p.second;
-
-				NIndex &hash_map = indexes_[len - 1];
-				const auto hash = hash_of_string(c, len);
-				auto f = hash_map.find(hash);
-				if (f == hash_map.end()) 
-					return result;
-
-				IndexValueSet &resultSet = f->second;
-
-				if (is_init_intersection) {
-					intersection = resultSet;
-					is_init_intersection = false;
-					continue;
-				}
-
-				IndexValueSet set_intersection_result;
-				std::set_intersection(
-					intersection.begin(), intersection.end(),
-					resultSet.begin(), resultSet.end(),
-					std::inserter(set_intersection_result, set_intersection_result.begin())
-					);
-				set_intersection_result.swap(intersection);
-
-				if (intersection.empty()) {
-					return result;
-				}
-			}
-
-			for (auto &p : intersection) {
-				V *str = p.second;
-				char * c_str;
-				const unsigned int size = consumer_.get_c_string(str, c_str);
-				if (!is_real_substrs(substrs, c_str, size, is_strict))
-					continue;
-
-				result.push_back({ p.first, str });
-			}
-
-			return result;
-		}
-
-		void add_del_index(IndexKey index, V *str, bool is_add)
-		{
-			using namespace std;
-			char *c_str;
-			IndexValue value = std::make_pair(index, str);
-			const unsigned int size = consumer_.get_c_string(str, c_str);
-			for (unsigned int pos = 0; pos < size; pos++)
-				for (unsigned int len = 1; pos + len <= size && len <= n_count_; len++) {
-					NIndex &hash_map = indexes_[len - 1];
-					HashKey hash = hash_of_string(&c_str[pos], len);
-					//if (len == 6) {
-					//	auto tmp = c_str[pos + len];
-					//	c_str[pos + len] = '\0';
-					//	cout << "add:" << &c_str[pos] << " len:" << len << "\n";
-					//	cout << "hash :" << hash << endl;
-					//	c_str[pos + len] = tmp;
-					//}
-
-					auto f = hash_map.find(hash);
-					if (f == hash_map.end()) {
-						if (!is_add)
-							continue;
-
-						IndexValueSet new_value_set;
-						new_value_set.insert(value);
-						hash_map.insert(std::make_pair(hash, new_value_set));
-
-						continue;
+			for (CStrLen &ngram : ngrams) {
+				NgramHash h = hash(ngram.first, ngram.second);
+				auto found = inverted_index.find(h);
+				if (found == inverted_index.end()) {
+					if (is_add) {
+						IndexedDocSet new_doc_set;
+						new_doc_set.insert(indexed_doc);
+						inverted_index.insert(std::make_pair(h, new_doc_set));
 					}
-
-					IndexValueSet &old_value_set = f->second;
+				} else {
+					IndexedDocSet &old_doc_set = found->second;
 
 					if (is_add) {
-						old_value_set.insert(value);
-					}
-					else {
-						old_value_set.erase(value);
-						if (old_value_set.empty()) {
-							hash_map.erase(hash);
+						old_doc_set.insert(indexed_doc);
+					} else {
+						old_doc_set.erase(indexed_doc);
+						if (old_doc_set.empty()) {
+							inverted_index.erase(h);
 						}
 					}
 				}
-		}
-
-		void select_substrs(CStrLenList &n_gramms, CStrLenList &substr, char *c_str,
-							const unsigned int size, const bool is_strict)
-		{
-			bool prev_is_start = true;
-			char *cur_c = nullptr;
-			int len = 0;
-			if (is_strict) {
-				substr.push_back({ c_str, size });
-				create_n_gramms(n_gramms, c_str, size);
-				return;
-			}
-
-			for (unsigned int i = 0; i < size; i++) {
-				if (c_str[i] == '*') {
-					if (!prev_is_start) {
-						substr.push_back({ cur_c, len });
-						create_n_gramms(n_gramms, cur_c, len);
-					}
-					prev_is_start = true;
-				}
-				else {
-					if (prev_is_start) {
-						cur_c = &c_str[i];
-						len = 0;
-					}
-					prev_is_start = false;
-					len++;
-				}
-			}
-
-			if (!prev_is_start) {
-				substr.push_back({ cur_c, len });
-				create_n_gramms(n_gramms, cur_c, len);
 			}
 		}
+		
+		Count search_one(Doc *query, const unsigned int max_edit_dist) {
+		    // TODO
+		}
 
-		void create_n_gramms(CStrLenList &n_gramms, char *c_str, const unsigned int size)
+		CountVector search_all(Doc *query, const unsigned int max_edit_dist)
 		{
-			const unsigned int len = std::min(size, n_count_);
+			char *query_cstr;
+			const int query_size = consumer_.get_c_string(query, query_cstr);
+
+            // Padding and spacing
+            string query_str(query_cstr);
+            string processed;
+            pad_and_space(query_str, processed);
+            const char *processed_cstr = processed.c_str();
+            const unsigned int processed_size = processed.size();
+
+			CStrLenList ngrams;
+			create_ngrams(ngrams, processed_cstr, processed_size);
+
+			CountVector result;
+
+			// Match none if empty string
+			if (ngrams.empty()) {
+				return result;
+			}
+
+            // Find results
+            Counter counter;
+			for (CStrLen &ngram : ngrams) {
+
+                // Query the ngram inverted index
+				NgramHash key = hash(ngram.first, ngram.second);
+				auto found = inverted_index.find(key);
+				if (found == inverted_index.end()) continue;
+				IndexedDocSet &resultSet = found->second;
+
+                // Accumulate found results in counter
+				for (IndexedDoc indexed_doc : found->second) {
+				    ++counter[indexed_doc.first];
+				}
+			}
+
+			// Select valid results
+            CountVector edit_distances;
+			for (Count count : counter) {
+				DocKey key = count.first;
+				unsigned long ncount = count.second;
+
+                auto found = doc_index.find(key);
+                Doc *doc = found->second;
+                char *doc_orig_cstr;
+    			const unsigned int doc_orig_size = consumer_.get_c_string(doc, doc_orig_cstr);
+
+    			// Padding and spacing
+    			string doc_orig_str(doc_orig_cstr);
+                string doc_str;
+                pad_and_space(doc_orig_str, doc_str);
+                const char *doc_cstr = doc_str.c_str();
+                const unsigned int doc_size = doc_str.size();
+
+                // Choose lower bound of ngram matches
+                unsigned int min_ngrams = max(processed.size(), doc_str.size()) - n + 1;
+                if (min_ngrams > max_edit_dist * n) {
+                    min_ngrams -= max_edit_dist * n;
+                } else {
+                    min_ngrams = 0;
+                }
+
+                // Check edit distance
+			    if (ncount < min_ngrams) continue;
+                const unsigned int ed = edit_distance(processed_cstr, doc_cstr);
+                if (ed <= max_edit_dist) {
+                    edit_distances.push_back({key, ed});
+                }
+			}
+
+            // Sort again by edit distance
+            sort(edit_distances.begin(), edit_distances.end(), CountByValueAsc());
+
+			return edit_distances;
+		}
+
+        void pad_and_space(string old_str, string &new_str) {
+            stringstream new_stream;
+            new_stream << padding;
+
+            int pos = -1;
+            int prev_pos = -1;
+            while (true) {
+                pos = old_str.find(SPACER, pos + 1);
+
+                if (pos == string::npos) {
+                    new_stream << old_str.substr(prev_pos + 1, old_str.size());
+                    new_stream << padding;
+                    break;
+                } else {
+                    new_stream << old_str.substr(prev_pos + 1, pos - prev_pos - 1);
+                    new_stream << padding;
+                }
+
+                prev_pos = pos;
+            }
+            
+            new_str = new_stream.str();
+        }
+
+		void create_ngrams(CStrLenList &ngrams, const char *c_str, const unsigned int size)
+		{
+			if (size < n) return;
 			unsigned int pos = 0;
-			while (true) {
-				n_gramms.push_back({ &c_str[pos], len });
-				const unsigned int end = pos + len;
-				if (end == size)
-					break;
-				pos = std::min(end, size - len);
+			for (unsigned int pos = 0; pos < size - n; pos++) {
+				ngrams.push_back({&c_str[pos], n});
 			}
 		}
 
-		bool is_real_substrs(CStrLenList &substrs, char * c_str, const unsigned int size,
-							 const bool is_strict)
-		{
-			bool is_there = true;
-			unsigned int offset = 0;
-			for (const auto &p : substrs) {
-				is_there = false;
-				char *c_sub = p.first;
-				unsigned int len = p.second;
-				if (is_strict) {
-					if (size == len && std::equal(c_str, c_str + size, c_sub)) {
-						is_there = true;
-						break;
-					}
-					continue;
-				}
-
-				while (offset + len <= size) {
-					if (std::equal(c_str + offset, c_str + offset + len, c_sub)) {
-						is_there = true;
-						offset += len;
-						break;
-					}
-					offset++;
-				}
-				if (!is_there)
-					break;
-			}
-
-			return is_there;
-		}
+        const unsigned int edit_distance(const char *s1, const char *s2) {
+            unsigned int s1len, s2len, x, y, lastdiag, olddiag;
+            s1len = strlen(s1);
+            s2len = strlen(s2);
+            unsigned int column[s1len+1];
+            for (y = 1; y <= s1len; y++)
+                column[y] = y;
+            for (x = 1; x <= s2len; x++) {
+                column[0] = x;
+                for (y = 1, lastdiag = x-1; y <= s1len; y++) {
+                    olddiag = column[y];
+                    column[y] = MIN3(column[y] + 1, column[y-1] + 1, lastdiag + (s1[y-1] == s2[x-1] ? 0 : 1));
+                    lastdiag = olddiag;
+                }
+            }
+            return(column[s1len]);
+        }
 	};
 }

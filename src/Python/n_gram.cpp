@@ -2,7 +2,7 @@
 #include <iostream>
 
 
-void 
+void
 NGram::addLine(PyObject *index, PyObject *str)
 {
 	if (!(PyLong_Check(index) && PyUnicode_Check(str))) {
@@ -16,20 +16,24 @@ NGram::addLine(PyObject *index, PyObject *str)
 PyObject *
 NGram::search(PyObject *pattern)
 {
-	return search(pattern, false);
+	return search(pattern, 0);
 }
 
-PyObject * 
-NGram::search(PyObject *pattern, const bool isStrict)
+PyObject *
+NGram::search(PyObject *pattern, const unsigned int max_edit_dist)
 {
 	if (!PyUnicode_Check(pattern)) {
 		throw std::string("Wrong type");
 	}
 
 	PyObject *result = PyList_New(0);
-	for (auto &p : pimpl_.search(pattern, isStrict)) {
+	for (auto &p : pimpl_.search(pattern, max_edit_dist)) {
 		PyObject *index = PyLong_FromLong(p.first);
-		PyList_Append(result, index);
+		PyObject *ed = PyLong_FromLong(p.second);
+		PyObject *tup = PyTuple_New(2);
+		PyTuple_SetItem(tup, 0, index);
+		PyTuple_SetItem(tup, 1, ed);
+		PyList_Append(result, tup);
 	}
 	return result;
 }
@@ -44,7 +48,7 @@ NGram::delLine(PyObject *index)
 	return pimpl_.del_line(PyLong_AsUnsignedLongMask(index));
 }
 
-const int 
+const int
 NGram::size()
 {
 	return pimpl_.size();
